@@ -10,9 +10,31 @@ from typing import Any
 PHRED_OFFSET = 33
 VALID_BASES = set("ACGTacgtNn")
 
+# 默认弱位点阈值：位点平均质量低于该值即视为弱位点。
+# 运行时以 settings_store 中的配置为准；此处仅作为未显式传参时的缺省。
+DEFAULT_WEAK_THRESHOLD = 30.0
+
 
 class ActorError(Exception):
     """Raised when an actor fails its stage."""
+
+
+def compute_weak_positions(
+    per_position: list[dict] | None, threshold: float
+) -> list[dict]:
+    """Server-side weak-position rule: mean_quality strictly below threshold.
+
+    Pure function shared by the pipeline (ReportActor) and the recompute
+    endpoint, so both always apply exactly the same rule.
+    """
+    weak = []
+    for p in per_position or []:
+        mean_q = p.get("mean_quality")
+        if mean_q is None:
+            continue
+        if mean_q < threshold:
+            weak.append({"position": p.get("position"), "mean_quality": mean_q})
+    return weak
 
 
 @dataclass
@@ -32,6 +54,7 @@ class PipelineContext:
     metrics: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     failed_actor: str | None = None
+    weak_threshold: float = DEFAULT_WEAK_THRESHOLD
 
 
 @dataclass
@@ -186,12 +209,17 @@ class ReportActor:
             return
         ctx = msg.context
         try:
+            weak = compute_weak_positions(
+                ctx.metrics.get("per_position"), ctx.weak_threshold
+            )
             report = {
                 "reads": ctx.metrics.get("reads"),
                 "mean_quality": ctx.metrics.get("mean_quality"),
                 "n_rate": ctx.metrics.get("n_rate"),
                 "n_count": ctx.metrics.get("n_count"),
                 "total_bases": ctx.metrics.get("total_bases"),
+                "weak_threshold": ctx.weak_threshold,
+                "weak_count": len(weak),
                 "per_position_summary": {
                     "positions": len(ctx.metrics.get("per_position") or []),
                     "first5": (ctx.metrics.get("per_position") or [])[:5],
@@ -205,11 +233,15 @@ class ReportActor:
                 ),
             }
             ctx.metrics["report"] = report
+            # 弱位点清单由服务端按阈值算出并写入指标，前端只读展示
+            ctx.metrics["weak_threshold"] = ctx.weak_threshold
+            ctx.metrics["weak_positions"] = weak
             # Flatten key metrics for API convenience
             ctx.metrics["summary"] = {
                 "reads": report["reads"],
                 "mean_quality": report["mean_quality"],
                 "n_rate": report["n_rate"],
+                "weak_count": report["weak_count"],
                 "per_position": report["per_position_summary"],
             }
             await out_q.put(QueueMessage(ok=True, context=ctx))

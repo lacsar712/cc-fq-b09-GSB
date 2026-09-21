@@ -77,3 +77,17 @@ class JobListItem(BaseModel):
 class HealthOut(BaseModel):
     status: str
     service: str
+
+
+class WeakThresholdConfigOut(BaseModel):
+    """Effective weak-position threshold plus audit info."""
+
+    threshold: float
+    default: float
+    updated_by: str | None = None
+    updated_at: datetime | None = None
+
+
+class WeakThresholdUpdate(BaseModel):
+    # Phred 质量分合法范围 0–93
+    threshold: float = Field(ge=0, le=93)

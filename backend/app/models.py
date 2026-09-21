@@ -37,6 +37,20 @@ class Job(Base):
     sample: Mapped[Sample | None] = relationship("Sample")
 
 
+class AppSetting(Base):
+    """Runtime key/value settings (e.g. weak-position quality threshold).
+
+    Rows here override env defaults from app.config; only bioops may write.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(256), nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class JobStage(Base):
     __tablename__ = "job_stages"
 

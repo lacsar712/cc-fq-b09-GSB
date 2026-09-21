@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.models import Job, JobStage
 from app.pipeline.actors import (
     ACTOR_CHAIN,
+    DEFAULT_WEAK_THRESHOLD,
     NContentActor,
     ParseActor,
     PipelineContext,
@@ -17,6 +18,7 @@ from app.pipeline.actors import (
     QueueMessage,
     ReportActor,
 )
+from app.settings_store import get_weak_threshold
 
 
 STAGE_NAMES = [cls.name for cls in ACTOR_CHAIN]
@@ -26,7 +28,9 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _run_chain(fastq_text: str) -> tuple[bool, PipelineContext, dict[str, dict]]:
+async def _run_chain(
+    fastq_text: str, weak_threshold: float = DEFAULT_WEAK_THRESHOLD
+) -> tuple[bool, PipelineContext, dict[str, dict]]:
     """
     Run Parse → QualityHist → NContent → Report via asyncio queues.
     Returns (success, context, stage_status keyed by actor name).
@@ -37,7 +41,7 @@ async def _run_chain(fastq_text: str) -> tuple[bool, PipelineContext, dict[str, 
         a.name: {"status": "pending", "message": None} for a in actors
     }
 
-    ctx = PipelineContext(fastq_text=fastq_text)
+    ctx = PipelineContext(fastq_text=fastq_text, weak_threshold=weak_threshold)
     await queues[0].put(QueueMessage(ok=True, context=ctx))
 
     final = QueueMessage(ok=False, context=ctx, error="流水线未执行")
@@ -77,7 +81,10 @@ def run_pipeline_sync(db: Session, job: Job) -> Job:
     job.status = "running"
     db.commit()
 
-    success, ctx, stage_status = asyncio.run(_run_chain(job.fastq_snapshot))
+    weak_threshold = get_weak_threshold(db)
+    success, ctx, stage_status = asyncio.run(
+        _run_chain(job.fastq_snapshot, weak_threshold=weak_threshold)
+    )
 
     for name, info in stage_status.items():
         st = stage_by_name[name]

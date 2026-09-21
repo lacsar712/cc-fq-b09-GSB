@@ -44,10 +44,14 @@ docker compose up --build
 
 1. 打开 http://localhost:3184 ，用 `bioops` / `fastq123456` 登录。
 2. **样例库** 看到 2 条样例 → 选合格样例 **提交质控作业**。
-3. 作业详情页看到四个 Actor 阶段均为成功，指标卡出现 `reads` / `mean_quality` / `n_rate`。
-4. 再跑损坏样例：`ParseActor` = failed，其余 = skipped。
-5. 退出，用 `auditor` / `audit123456` 登录：可看历史与详情，提交作业接口返回 403 / 前端无提交入口。
-6. 健康检查：`curl http://localhost:8184/api/health`
+3. 作业详情页看到四个 Actor 阶段均为成功，指标卡出现 `reads` / `mean_quality` / `n_rate` / `弱位点数`。
+4. 详情页下方出现 **per_position 平均质量曲线**（蓝线）与 **弱位点清单**：
+   - 弱位点由**服务端**按「平均质量下限」算出并写入 `metrics.weak_positions`，前端只读展示，不自行扫描；
+   - 默认阈值 30（可用环境变量 `WEAK_QUALITY_THRESHOLD` 改默认值），合格样例默认无弱位点。
+5. **运维调阈值自测**：详情页输入更高阈值（如 `41`）→ **保存阈值** → **重算弱位点** → 清单变非空，且全部满足 `mean_quality < 阈值`；重跑新作业也会按新阈值计算。
+6. 再跑损坏样例：`ParseActor` = failed，其余 = skipped；曲线与弱位点区域提示「无 per_position 数据」，重算按钮不可用（接口返回 409）。
+7. 退出，用 `auditor` / `audit123456` 登录：可看历史、详情、曲线与弱位点清单，但无阈值编辑/重算入口；直接调用 `PUT /api/config/weak-threshold` 或 `POST /api/jobs/{id}/recompute-weak` 返回 403。
+8. 健康检查：`curl http://localhost:8184/api/health`
 
 ## API
 
@@ -58,6 +62,11 @@ docker compose up --build
 - `GET  /api/jobs`
 - `GET  /api/jobs/{id}`
 - `GET  /api/jobs/{id}/stages`
+- `GET  /api/config/weak-threshold`（登录即可读，含审计员）
+- `PUT  /api/config/weak-threshold` `{ "threshold": 41.0 }`（仅 bioops，范围 0–93，落 `app_settings` 表）
+- `POST /api/jobs/{id}/recompute-weak`（仅 bioops；仅成功作业，按当前阈值重算 `weak_positions` 写回 metrics）
+
+阈值生效顺序：`app_settings` 表（运维运行时修改）> 环境变量 `WEAK_QUALITY_THRESHOLD` > 内置默认 30。
 
 ## 本地单测（可选）
 
@@ -67,7 +76,8 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-覆盖：畸形 FASTQ 在 `ParseActor` 失败；正常样例产出 `mean_quality`。
+覆盖：畸形 FASTQ 在 `ParseActor` 失败；正常样例产出 `mean_quality`；弱位点阈值规则、
+调阈值后重算非空且一致（SQLite 端到端）；审计员改阈值/重算 403；失败作业重算 409。
 
 ## 目录结构
 
@@ -82,9 +92,11 @@ pytest -q
     data/{good,broken}.fastq
     app/
       main.py api.py auth.py models.py schemas.py
+      config.py settings_store.py
       pipeline/{actors,runner}.py
-    tests/test_actors.py
+    tests/{test_actors,test_weak_api}.py
   frontend/
     Dockerfile nginx.conf
     src/pages/{Login,Samples,JobSubmit,JobDetail,JobHistory}Page.vue
+    src/components/QualityCurve.vue
 ```

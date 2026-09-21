@@ -2,8 +2,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import authenticate_user, create_access_token, get_current_user, require_bioops
+from app.config import settings
 from app.database import SessionLocal, get_db
-from app.models import Job, JobStage, Sample
+from app.models import AppSetting, Job, JobStage, Sample
+from app.pipeline.actors import compute_weak_positions
 from app.pipeline.runner import create_job_stages, run_pipeline_sync
 from app.schemas import (
     HealthOut,
@@ -14,7 +16,10 @@ from app.schemas import (
     SampleOut,
     StageOut,
     TokenResponse,
+    WeakThresholdConfigOut,
+    WeakThresholdUpdate,
 )
+from app.settings_store import WEAK_THRESHOLD_KEY, get_weak_threshold, set_weak_threshold
 
 
 router = APIRouter(prefix="/api")
@@ -127,3 +132,79 @@ def get_job_stages(
         .order_by(JobStage.stage_order)
         .all()
     )
+
+
+def _weak_config_out(db: Session) -> WeakThresholdConfigOut:
+    row = db.get(AppSetting, WEAK_THRESHOLD_KEY)
+    return WeakThresholdConfigOut(
+        threshold=get_weak_threshold(db),
+        default=settings.weak_quality_threshold,
+        updated_by=row.updated_by if row else None,
+        updated_at=row.updated_at if row else None,
+    )
+
+
+@router.get("/config/weak-threshold", response_model=WeakThresholdConfigOut)
+def read_weak_threshold(
+    _user: dict = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """当前弱位点阈值（所有登录用户可读，含审计员）。"""
+    return _weak_config_out(db)
+
+
+@router.put("/config/weak-threshold", response_model=WeakThresholdConfigOut)
+def update_weak_threshold(
+    body: WeakThresholdUpdate,
+    user: dict = Depends(require_bioops),
+    db: Session = Depends(get_db),
+):
+    """运维调整弱位点平均质量下限；审计员调用返回 403。"""
+    set_weak_threshold(db, body.threshold, user["username"])
+    return _weak_config_out(db)
+
+
+@router.post("/jobs/{job_id}/recompute-weak", response_model=JobOut)
+def recompute_weak_positions(
+    job_id: int,
+    _user: dict = Depends(require_bioops),
+    db: Session = Depends(get_db),
+):
+    """按当前阈值对已成功作业重算弱位点清单（服务端计算，写回 metrics）。"""
+    job = (
+        db.query(Job)
+        .options(joinedload(Job.stages))
+        .filter(Job.id == job_id)
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="作业不存在")
+    if job.status != "success":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="仅成功完成的作业可重算弱位点",
+        )
+    metrics = dict(job.metrics or {})
+    per_position = metrics.get("per_position")
+    if not per_position:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该作业无 per_position 数据，无法重算弱位点",
+        )
+
+    threshold = get_weak_threshold(db)
+    weak = compute_weak_positions(per_position, threshold)
+    metrics["weak_positions"] = weak
+    metrics["weak_threshold"] = threshold
+    if isinstance(metrics.get("report"), dict):
+        metrics["report"] = {
+            **metrics["report"],
+            "weak_threshold": threshold,
+            "weak_count": len(weak),
+        }
+    if isinstance(metrics.get("summary"), dict):
+        metrics["summary"] = {**metrics["summary"], "weak_count": len(weak)}
+
+    job.metrics = metrics
+    db.commit()
+    db.refresh(job)
+    return job

@@ -62,4 +62,19 @@ export async function createJob(body) {
   return data
 }
 
+export async function getWeakThresholdConfig() {
+  const { data } = await api.get('/config/weak-threshold')
+  return data
+}
+
+export async function updateWeakThreshold(threshold) {
+  const { data } = await api.put('/config/weak-threshold', { threshold })
+  return data
+}
+
+export async function recomputeWeakPositions(jobId) {
+  const { data } = await api.post(`/jobs/${jobId}/recompute-weak`)
+  return data
+}
+
 export default api
