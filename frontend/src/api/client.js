@@ -62,4 +62,19 @@ export async function createJob(body) {
   return data
 }
 
+export async function getQualityConfig() {
+  const { data } = await api.get('/quality-config')
+  return data
+}
+
+export async function updateQualityConfig(body) {
+  const { data } = await api.put('/quality-config', body)
+  return data
+}
+
+export async function recomputeJobWeak(id) {
+  const { data } = await api.post(`/jobs/${id}/recompute-weak`)
+  return data
+}
+
 export default api

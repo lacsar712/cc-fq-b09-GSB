@@ -3,17 +3,24 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.auth import authenticate_user, create_access_token, get_current_user, require_bioops
 from app.database import SessionLocal, get_db
-from app.models import Job, JobStage, Sample
-from app.pipeline.runner import create_job_stages, run_pipeline_sync
+from app.models import AppSetting, Job, JobStage, Sample
+from app.pipeline.runner import create_job_stages, recompute_weak_positions, run_pipeline_sync
 from app.schemas import (
     HealthOut,
     JobCreate,
     JobListItem,
     JobOut,
     LoginRequest,
+    QualityConfigOut,
+    QualityConfigUpdate,
     SampleOut,
     StageOut,
     TokenResponse,
+)
+from app.settings_service import (
+    WEAK_FLOOR_KEY,
+    get_weak_quality_floor,
+    set_weak_quality_floor,
 )
 
 
@@ -127,3 +134,64 @@ def get_job_stages(
         .order_by(JobStage.stage_order)
         .all()
     )
+
+
+@router.post("/jobs/{job_id}/recompute-weak", response_model=JobOut)
+def recompute_job_weak(
+    job_id: int,
+    user: dict = Depends(require_bioops),
+    db: Session = Depends(get_db),
+):
+    """对已成功作业按当前阈值重算 weak_positions（不重跑流水线）。仅运维。"""
+    job = (
+        db.query(Job)
+        .options(joinedload(Job.stages))
+        .filter(Job.id == job_id)
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="作业不存在")
+    if job.status != "success":
+        if job.status == "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="作业失败，无 per_position 数据，无法重算弱位点清单",
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="仅成功作业可重算弱位点清单")
+    try:
+        recompute_weak_positions(db, job)
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return job
+
+
+@router.get("/quality-config", response_model=QualityConfigOut)
+def get_quality_config(_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    has_override = (
+        db.query(AppSetting).filter(AppSetting.key == WEAK_FLOOR_KEY).first() is not None
+    )
+    return QualityConfigOut(
+        weak_quality_floor=get_weak_quality_floor(db),
+        source="db" if has_override else "default",
+    )
+
+
+@router.put("/quality-config", response_model=QualityConfigOut)
+def update_quality_config(
+    body: QualityConfigUpdate,
+    user: dict = Depends(require_bioops),
+    db: Session = Depends(get_db),
+):
+    """修改弱位点平均质量下限（仅运维；审计员只读，调用返回 403）。"""
+    try:
+        value = set_weak_quality_floor(db, body.weak_quality_floor)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if body.apply_to_successful_jobs:
+        for job in db.query(Job).filter(Job.status == "success").all():
+            try:
+                recompute_weak_positions(db, job, value)
+            except LookupError:
+                # 历史成功作业理论上都有 per_position；缺失则跳过，不阻断配置更新
+                continue
+    return QualityConfigOut(weak_quality_floor=value, source="db")

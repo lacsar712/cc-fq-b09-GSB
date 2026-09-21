@@ -77,3 +77,13 @@ class JobListItem(BaseModel):
 class HealthOut(BaseModel):
     status: str
     service: str
+
+
+class QualityConfigOut(BaseModel):
+    weak_quality_floor: float
+    source: str  # db（运维已改）/ default（环境变量或内置默认）
+
+
+class QualityConfigUpdate(BaseModel):
+    weak_quality_floor: float = Field(ge=0, le=93)
+    apply_to_successful_jobs: bool = False

@@ -23,6 +23,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://fastq:fastq@db:5432/fastq_qc
       JWT_SECRET: fastq-qc-pipeline-dev-secret
+      # 弱位点平均质量下限初始值；运维可在界面/PUT /api/quality-config 运行时修改（持久化到库）
+      WEAK_QUALITY_FLOOR: "28"
     depends_on:
       db:
         condition: service_healthy

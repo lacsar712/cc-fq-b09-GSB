@@ -11,6 +11,38 @@ PHRED_OFFSET = 33
 VALID_BASES = set("ACGTacgtNn")
 
 
+def compute_weak_positions(
+    per_position: list[dict[str, Any]] | None, quality_floor: float
+) -> list[dict[str, Any]]:
+    """服务端按阈值计算弱位点清单：位点平均质量严格低于下限即弱位点。
+
+    纯函数，不依赖读段原文，便于对已成功作业按新阈值重算。前端禁止自行扫描。
+    """
+    if not per_position:
+        return []
+    return [
+        {"position": p["position"], "mean_quality": p["mean_quality"]}
+        for p in per_position
+        if p.get("mean_quality") is not None and p["mean_quality"] < quality_floor
+    ]
+
+
+def apply_weak_floor(metrics: dict[str, Any], quality_floor: float) -> dict[str, Any]:
+    """按阈值重算 metrics 中的弱位点清单，并同步 report/summary 副本。"""
+    weak = compute_weak_positions(metrics.get("per_position"), quality_floor)
+    metrics["weak_positions"] = weak
+    metrics["weak_quality_floor"] = quality_floor
+    report = metrics.get("report")
+    if isinstance(report, dict):
+        report["weak_positions"] = weak
+        report["weak_quality_floor"] = quality_floor
+    summary = metrics.get("summary")
+    if isinstance(summary, dict):
+        summary["weak_positions_count"] = len(weak)
+        summary["weak_quality_floor"] = quality_floor
+    return metrics
+
+
 class ActorError(Exception):
     """Raised when an actor fails its stage."""
 
@@ -32,6 +64,7 @@ class PipelineContext:
     metrics: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     failed_actor: str | None = None
+    quality_floor: float = 28.0
 
 
 @dataclass
@@ -100,6 +133,9 @@ class ParseActor:
 class QualityHistActor:
     name = "QualityHistActor"
 
+    def __init__(self, quality_floor: float = 28.0) -> None:
+        self.quality_floor = quality_floor
+
     async def run(self, in_q: asyncio.Queue, out_q: asyncio.Queue) -> None:
         msg: QueueMessage = await in_q.get()
         if not msg.ok:
@@ -111,6 +147,8 @@ class QualityHistActor:
             ctx.metrics["mean_quality"] = mean_q
             ctx.metrics["per_position"] = per_pos
             ctx.metrics["quality_histogram"] = hist
+            # 弱位点清单由服务端按阈值算出，随指标持久化（report/summary 由 ReportActor 再同步）
+            apply_weak_floor(ctx.metrics, ctx.quality_floor)
             await out_q.put(QueueMessage(ok=True, context=ctx))
         except Exception as exc:  # noqa: BLE001
             err = f"质量统计失败: {exc}"
@@ -203,6 +241,8 @@ class ReportActor:
                         key=lambda kv: int(kv[0]),
                     )[:10]
                 ),
+                "weak_quality_floor": ctx.metrics.get("weak_quality_floor"),
+                "weak_positions": ctx.metrics.get("weak_positions") or [],
             }
             ctx.metrics["report"] = report
             # Flatten key metrics for API convenience
@@ -211,6 +251,8 @@ class ReportActor:
                 "mean_quality": report["mean_quality"],
                 "n_rate": report["n_rate"],
                 "per_position": report["per_position_summary"],
+                "weak_positions_count": len(report["weak_positions"]),
+                "weak_quality_floor": report["weak_quality_floor"],
             }
             await out_q.put(QueueMessage(ok=True, context=ctx))
         except Exception as exc:  # noqa: BLE001

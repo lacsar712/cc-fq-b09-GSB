@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.config import settings as app_settings
 from app.models import Job, JobStage
 from app.pipeline.actors import (
     ACTOR_CHAIN,
@@ -16,7 +17,9 @@ from app.pipeline.actors import (
     QualityHistActor,
     QueueMessage,
     ReportActor,
+    apply_weak_floor,
 )
+from app.settings_service import get_weak_quality_floor
 
 
 STAGE_NAMES = [cls.name for cls in ACTOR_CHAIN]
@@ -26,18 +29,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _run_chain(fastq_text: str) -> tuple[bool, PipelineContext, dict[str, dict]]:
+async def _run_chain(
+    fastq_text: str, quality_floor: float | None = None
+) -> tuple[bool, PipelineContext, dict[str, dict]]:
     """
     Run Parse → QualityHist → NContent → Report via asyncio queues.
     Returns (success, context, stage_status keyed by actor name).
     """
-    actors = [ParseActor(), QualityHistActor(), NContentActor(), ReportActor()]
+    if quality_floor is None:
+        quality_floor = float(app_settings.weak_quality_floor)
+    actors = [
+        ParseActor(),
+        QualityHistActor(quality_floor=quality_floor),
+        NContentActor(),
+        ReportActor(),
+    ]
     queues: list[asyncio.Queue] = [asyncio.Queue() for _ in range(len(actors) + 1)]
     stage_status: dict[str, dict] = {
         a.name: {"status": "pending", "message": None} for a in actors
     }
 
-    ctx = PipelineContext(fastq_text=fastq_text)
+    ctx = PipelineContext(fastq_text=fastq_text, quality_floor=quality_floor)
     await queues[0].put(QueueMessage(ok=True, context=ctx))
 
     final = QueueMessage(ok=False, context=ctx, error="流水线未执行")
@@ -77,7 +89,8 @@ def run_pipeline_sync(db: Session, job: Job) -> Job:
     job.status = "running"
     db.commit()
 
-    success, ctx, stage_status = asyncio.run(_run_chain(job.fastq_snapshot))
+    quality_floor = get_weak_quality_floor(db)
+    success, ctx, stage_status = asyncio.run(_run_chain(job.fastq_snapshot, quality_floor))
 
     for name, info in stage_status.items():
         st = stage_by_name[name]
@@ -99,6 +112,26 @@ def run_pipeline_sync(db: Session, job: Job) -> Job:
         job.metrics = ctx.metrics or None
         job.error_message = ctx.error or "流水线失败"
     job.finished_at = _utcnow()
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def recompute_weak_positions(db: Session, job: Job, quality_floor: float | None = None) -> Job:
+    """对已成功作业按当前（或指定）阈值重算 weak_positions，不重跑流水线。
+
+    依赖成功时持久化的 per_position；无该数据则抛 LookupError（例如失败作业）。
+    """
+    if quality_floor is None:
+        quality_floor = get_weak_quality_floor(db)
+    metrics = job.metrics or {}
+    per_position = metrics.get("per_position")
+    if not per_position:
+        raise LookupError("该作业没有 per_position 数据，无法重算弱位点")
+    # SQLAlchemy JSON 变更追踪需要整体替换引用
+    new_metrics = dict(metrics)
+    apply_weak_floor(new_metrics, float(quality_floor))
+    job.metrics = new_metrics
     db.commit()
     db.refresh(job)
     return job

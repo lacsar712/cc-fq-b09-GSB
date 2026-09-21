@@ -36,6 +36,7 @@
             Q={{ props.row.metrics.mean_quality ?? '—' }}
             · N={{ props.row.metrics.n_rate ?? '—' }}
             · reads={{ props.row.metrics.reads ?? '—' }}
+            · 弱位点={{ props.row.metrics.weak_positions?.length ?? 0 }}
           </span>
           <span v-else class="text-grey-6">—</span>
         </q-td>
